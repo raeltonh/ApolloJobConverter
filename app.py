@@ -37,7 +37,7 @@ def inject_corporate_styles():
     <style>
     :root { --corp-blue: #8ab4f8; --corp-bg: #0d1117; --corp-panel: #161b22; --corp-gray: #c9d1d9; }
     body, .main, .block-container { background-color: var(--corp-bg) !important; color: var(--corp-gray) !important; }
-    h1, h2, h3 { color: var(--corp-blue) !important; }
+    h1, h2, h3, h5 { color: var(--corp-blue) !important; }
     .stTextInput input { font-family: monospace; font-weight: bold; color: #8ab4f8; }
     div[data-testid="stMetricValue"] { font-size: 1.2rem !important; color: #8ab4f8; }
     </style>
@@ -312,8 +312,10 @@ def main():
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("1. Input Files")
-        atlas_zip = st.file_uploader("Upload Atlas QPP ZIP", type=["zip"])
-        kjob_template = st.file_uploader("Upload Template .kjob", type=["kjob"])
+        st.markdown("##### Upload Atlas QPP ZIP")
+        atlas_zip = st.file_uploader("Upload Atlas QPP ZIP", type=["zip"], label_visibility="collapsed")
+        st.markdown("##### Upload Template .kjob")
+        kjob_template = st.file_uploader("Upload Template .kjob", type=["kjob"], label_visibility="collapsed")
     
     with col2:
         st.subheader("2. Settings")
@@ -333,11 +335,13 @@ def main():
         else:
             st.info("ℹ️ Using internal TIFF metadata. Safest option.")
 
-        spray = st.slider("Chemical Intensity (Spray) %", 0, 100, 100)
+        st.markdown("##### Chemical Intensity (Spray) %")
+        spray = st.slider("Chemical Intensity (Spray) %", 0, 100, 100, label_visibility="collapsed")
         st.caption(f"KJOB Value: **{spray/100.0}**")
         
         st.markdown("#### 🔑 GUID (Identifier)")
-        guid_final = st.text_input("Active GUID:", value=st.session_state["master_guid"], key="input_guid_display")
+        st.markdown("##### Active GUID:")
+        guid_final = st.text_input("Active GUID:", value=st.session_state["master_guid"], key="input_guid_display", label_visibility="collapsed")
         st.session_state["master_guid"] = guid_final
 
         c1, c2 = st.columns(2)
