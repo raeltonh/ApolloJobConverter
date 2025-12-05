@@ -1,0 +1,288 @@
+import json
+import zipfile
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, Tuple, Optional
+
+import streamlit as st
+
+# ---------------------------------------------------------
+# Constants
+# ---------------------------------------------------------
+
+DEFAULT_GUID = "6f346ae1-3cc7-4b46-a7d6-ab089222ab51"
+
+
+# Mapping between Apollo separation name → Atlas channel suffix
+# Atlas Qc → Apollo Fc
+# Atlas Qw → Apollo Fw
+# Others stay the same
+APOLLO_TO_ATLAS_CHANNEL_MAP = {
+    "C": "C",
+    "M": "M",
+    "Y": "Y",
+    "K": "K",
+    "R": "R",
+    "G": "G",
+    "W": "W",
+    "Fw": "Qw",   # Atlas Qw
+    "Fc": "Qc",   # Atlas Qc
+    "Iw": "Iw",
+    "Ic": "Ic",
+}
+ATLAS_TO_APOLLO_CHANNEL_MAP = {v: k for k, v in APOLLO_TO_ATLAS_CHANNEL_MAP.items()}
+
+
+# ---------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------
+
+def parse_atlas_channels(atlas_dir: Path) -> Tuple[Optional[str], Dict[str, Path]]:
+    """
+    Detect Atlas Max channels from TIFF filenames.
+    Accepts filenames like:
+        atp v2.5 - amax plus-standard pallet_164670_XXXXX_C.tif
+
+    - Looks recursively in all subfolders
+    - Ignores macOS hidden files (._filename.tif) and __MACOSX
+    """
+
+    channels: Dict[str, Path] = {}
+    base_name: Optional[str] = None
+
+    valid_channels = {
+        "C", "M", "Y", "K", "R", "G", "W",
+        "Qc", "Qw", "Iw", "Ic"
+    }
+
+    # rglob -> search recursively in all subfolders
+    for tif_path in atlas_dir.rglob("*.tif"):
+
+        # Skip __MACOSX folders
+        if "__MACOSX" in tif_path.parts:
+            continue
+
+        # Skip macOS invisible files
+        if tif_path.name.startswith("._"):
+            continue
+
+        stem = tif_path.stem  # filename without extension
+
+        if "_" not in stem:
+            continue
+
+        # Split only on the LAST underscore
+        base_part, channel_part = stem.rsplit("_", 1)
+
+        if channel_part not in valid_channels:
+            continue
+
+        if base_name is None:
+            base_name = base_part
+
+        channels[channel_part] = tif_path
+
+    return base_name, channels
+
+
+def save_kjob_json(kjob_path: Path, data: dict) -> None:
+    """Save updated .kjob JSON."""
+    with kjob_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def create_kjob_data(
+    job_base_name: str,
+    spray_percentage: float,
+    guid: str,
+    atlas_channels: Dict[str, Path],
+) -> dict:
+    """Creates a new .kjob data structure from scratch."""
+
+    separations = []
+    for atlas_channel_name in atlas_channels:
+        apollo_channel_name = ATLAS_TO_APOLLO_CHANNEL_MAP.get(atlas_channel_name)
+        if not apollo_channel_name:
+            st.warning(f"Skipping unknown Atlas channel: {atlas_channel_name}")
+            continue
+
+        new_filename = f"{job_base_name}_{guid}_{apollo_channel_name}.tif"
+        sep_data = {
+            "Name": apollo_channel_name,
+            "ImageName": new_filename,
+            "Location": {
+                "Path": new_filename,
+                "Url": new_filename,
+            },
+        }
+        separations.append(sep_data)
+
+    # Sort separations by a conventional order if possible
+    # This is just for prettier output in the JSON
+    preferred_order = ["C", "M", "Y", "K", "R", "G", "W", "Fw", "Fc", "Iw", "Ic"]
+    separations.sort(key=lambda x: preferred_order.index(x["Name"]) if x["Name"] in preferred_order else 99)
+
+    kjob = {
+        "IdentificationDetails": {
+            "JobName": f"{job_base_name}-job",
+        },
+        "PrintSectionList": [
+            {
+                "SpraySettings": {
+                    "Percentage": float(spray_percentage),
+                },
+                "SeparationDataList": separations,
+            }
+        ],
+        "ProductPartList": [],
+        "ToolSettings": {},
+    }
+    return kjob
+
+
+# ---------------------------------------------------------
+# Core Conversion
+# ---------------------------------------------------------
+
+def convert_job(
+    atlas_zip_bytes,
+    spray_percentage: float,
+    guid: str,
+) -> bytes:
+    """
+    Main conversion function:
+    - Unzip Atlas channels
+    - Generate KJOB from scratch
+    - Create job structure and copy TIFFs
+    - Rebuild ZIP
+    """
+
+    with tempfile.TemporaryDirectory() as tmpstr:
+        tmp = Path(tmpstr)
+
+        # Save and extract Atlas ZIP
+        atlas_zip = tmp / "atlas.zip"
+        atlas_zip.write_bytes(atlas_zip_bytes)
+        atlas_dir = tmp / "atlas"
+        atlas_dir.mkdir()
+        with zipfile.ZipFile(atlas_zip, "r") as z:
+            z.extractall(atlas_dir)
+
+        # This is the root of our new job package
+        output_dir = tmp / "apollo_job_package"
+        output_dir.mkdir()
+
+        # 1. Parse Atlas TIFFs to get a base name and channel list
+        base_name, channels = parse_atlas_channels(atlas_dir)
+        if base_name is None or not channels:
+            raise ValueError(
+                "Could not detect valid Atlas channel files.\n"
+                "Ensure they follow the format: <basename>_<CHANNEL>.tif"
+            )
+
+        # 2. Generate the .kjob data
+        kjob_data = create_kjob_data(
+            job_base_name=base_name,
+            spray_percentage=spray_percentage,
+            guid=guid,
+            atlas_channels=channels,
+        )
+
+        # 3. Save the new .kjob file
+        kjob_path = output_dir / f"{base_name}.kjob"
+        save_kjob_json(kjob_path, kjob_data)
+
+        # 4. Copy and rename TIFFs into the output directory
+        for atlas_channel_name, source_tif_path in channels.items():
+            apollo_channel_name = ATLAS_TO_APOLLO_CHANNEL_MAP.get(atlas_channel_name)
+            if not apollo_channel_name:
+                continue # Already warned in create_kjob_data
+
+            new_filename = f"{base_name}_{guid}_{apollo_channel_name}.tif"
+            dest_tif_path = output_dir / new_filename
+            shutil.copy2(source_tif_path, dest_tif_path)
+
+
+        # 5. Pack the final output ZIP
+        output_zip_path = tmp / f"{base_name}_apollo_job.zip"
+        with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for file_path in output_dir.rglob("*"):
+                archive_name = file_path.relative_to(output_dir)
+                z.write(file_path, archive_name)
+
+        return output_zip_path.read_bytes()
+
+
+
+# ---------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------
+
+def main():
+    st.set_page_config(
+        page_title="Apollo Job Converter",
+        page_icon="🛰️",
+        layout="centered"
+    )
+
+    st.title("🛰️ Apollo Job Converter")
+    st.write(
+        """
+        This tool converts **Atlas Max** 1-bit TIFF separations into a fully
+        structured **Apollo job package**, generating a new job from scratch
+        and allowing custom Spray settings.
+        """
+    )
+
+    st.header("1. Upload separations")
+
+    atlas_zip = st.file_uploader(
+        "Atlas Max separations (.zip) — TIFFs inside with format <basename>_<channel>.tif",
+        type=["zip"]
+    )
+
+    st.header("2. Settings")
+
+    spray = st.number_input(
+        "Spray Percentage",
+        min_value=0.0,
+        max_value=2.0,
+        value=0.5,
+        step=0.1
+    )
+
+    guid = st.text_input(
+        "GUID for Apollo TIFF filenames",
+        value=DEFAULT_GUID
+    )
+
+    st.markdown("---")
+
+    if st.button("🚀 Convert to Apollo Job", type="primary"):
+        if not atlas_zip:
+            st.error("Please upload the Atlas Max ZIP file.")
+            return
+
+        try:
+            with st.spinner("Processing job..."):
+                result = convert_job(
+                    atlas_zip_bytes=atlas_zip.getvalue(),
+                    spray_percentage=spray,
+                    guid=guid,
+                )
+
+            st.success("Job converted successfully!")
+            st.download_button(
+                "⬇ Download converted Apollo job (.zip)",
+                result,
+                file_name="apollo_converted_job.zip",
+                mime="application/zip"
+            )
+
+        except Exception as e:
+            st.error(f"Conversion failed:\n\n{e}")
+
+
+if __name__ == "__main__":
+    main()

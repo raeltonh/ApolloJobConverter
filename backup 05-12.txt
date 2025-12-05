@@ -1,0 +1,232 @@
+import zipfile
+import io
+import os
+import uuid
+import re
+import json
+from pathlib import Path
+from typing import Tuple, Optional
+
+import streamlit as st
+import pandas as pd
+from PIL import Image
+import numpy as np
+import warnings
+
+# --- SYSTEM CONFIGURATION ---
+Image.MAX_IMAGE_PIXELS = 500_000_000 
+warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+
+# OCR Configuration
+HAS_OCR = False
+try:
+    import pytesseract
+    # pytesseract.pytesseract.tesseract_cmd = r'/usr/local/bin/tesseract' 
+    HAS_OCR = True
+except ImportError:
+    pass
+
+# --- VISUAL STYLES ---
+def inject_corporate_styles():
+    st.markdown("""
+    <style>
+    :root { --corp-blue: #8ab4f8; --corp-bg: #0d1117; --corp-panel: #161b22; --corp-gray: #c9d1d9; }
+    body, .main, .block-container { background-color: var(--corp-bg) !important; color: var(--corp-gray) !important; }
+    h1, h2, h3 { color: var(--corp-blue) !important; }
+    .stTextInput input { font-family: monospace; font-weight: bold; color: #8ab4f8; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- MAPPING ---
+ATLAS_TO_APOLLO_CHANNEL_MAP = {
+    "C": "C", "M": "M", "Y": "Y", "K": "K", "R": "R", "G": "G", "W": "W",
+    "Iw": "Fw", "Ic": "Fc", "Qw": "Fw", "Qc": "Fc", "Varnish": "Q.fix"
+}
+
+# --- FUNCTIONS ---
+def extract_guid_from_image(image_bytes: bytes) -> str:
+    if not HAS_OCR: return None
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = img.convert('L')
+            text = pytesseract.image_to_string(img)
+            uuid_pattern = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+            match = re.search(uuid_pattern, text)
+            return match.group(0) if match else None
+    except Exception: return None
+
+def process_channel_image(image_bytes: bytes, filename: str, spray_percentage: int) -> Tuple[Optional[bytes], str, str]:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            name_stem = Path(filename).stem
+            if "_" in name_stem:
+                base_name, original_suffix = name_stem.rsplit('_', 1)
+            else: return None, "", ""
+
+            new_suffix = ATLAS_TO_APOLLO_CHANNEL_MAP.get(original_suffix)
+            if not new_suffix:
+                s_upper = original_suffix.upper()
+                if s_upper == "IW": new_suffix = "Fw"
+                elif s_upper == "IC": new_suffix = "Fc"
+                elif s_upper == "QW": new_suffix = "Fw"
+                elif s_upper == "QC": new_suffix = "Fc"
+                else: return None, base_name, ""
+
+            if img.mode != 'L': img = img.convert('L')
+            
+            # ATENÇÃO: Se estamos controlando o Spray pelo KJOB, talvez não queira reduzir a imagem.
+            # Mas mantive aqui por segurança. Se quiser que o slider afete SÓ o KJOB, remova esse if.
+            if new_suffix in ["Q.fix", "Fw", "Fc"] and spray_percentage < 100:
+                arr = np.array(img, dtype=float) * (spray_percentage / 100.0)
+                img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+            buffer = io.BytesIO()
+            img.save(buffer, format="TIFF", compression="tiff_lzw")
+            return buffer.getvalue(), base_name, new_suffix
+    except Exception: return None, "", ""
+
+def recursive_spray_update(data, percentage_float):
+    """
+    Navega por todo o JSON procurando por 'SpraySettings' 
+    e atualiza a 'Percentage' quando encontrar.
+    """
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key == "SpraySettings" and isinstance(value, dict):
+                # Encontrou! Atualiza o valor.
+                if "Percentage" in value:
+                    value["Percentage"] = percentage_float
+            elif isinstance(value, (dict, list)):
+                recursive_spray_update(value, percentage_float)
+    elif isinstance(data, list):
+        for item in data:
+            recursive_spray_update(item, percentage_float)
+
+def update_kjob_smart(kjob_bytes: bytes, new_guid: str, job_name: str, spray_percent_int: int) -> str:
+    """
+    Atualiza ID, Nome e também o Spray Percentage no KJOB.
+    """
+    try:
+        content_str = kjob_bytes.decode('utf-8', errors='ignore')
+        data = json.loads(content_str)
+        
+        # 1. Atualiza IDs (IdentificationDetails)
+        if "IdentificationDetails" in data:
+            if "JobIdentifier" in data["IdentificationDetails"]:
+                data["IdentificationDetails"]["JobIdentifier"]["Id"] = new_guid
+            if "JobName" in data["IdentificationDetails"]:
+                data["IdentificationDetails"]["JobName"] = job_name
+        
+        # 2. Atualiza Spray Percentage (Ex: 50% -> 0.5)
+        # O valor no JSON deve ser float entre 0.0 e 1.0
+        spray_float = round(spray_percent_int / 100.0, 2)
+        recursive_spray_update(data, spray_float)
+
+        return json.dumps(data, indent=2)
+    except json.JSONDecodeError:
+        # Fallback simples se der erro no JSON (não atualiza spray, só ID via regex)
+        uuid_pattern = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+        return re.sub(uuid_pattern, new_guid, content_str)
+    except Exception: return ""
+
+def create_apollo_package(atlas_zip_bytes: bytes, kjob_template_bytes: bytes, spray: int, guid: str) -> bytes:
+    output_zip_buffer = io.BytesIO()
+    detected_job_name = "Job_Apollo"
+    with zipfile.ZipFile(output_zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_out:
+        with zipfile.ZipFile(io.BytesIO(atlas_zip_bytes), "r") as zip_in:
+            for file_info in zip_in.infolist():
+                if file_info.filename.lower().endswith((".tif", ".tiff")) and not file_info.filename.startswith("__MACOSX"):
+                    with zip_in.open(file_info) as file: image_data = file.read()
+                    # Processa imagem (Nota: spray também afeta a imagem aqui, se quiser desligar, mude na função)
+                    processed_data, base_name, new_ch = process_channel_image(image_data, file_info.filename, spray)
+                    if processed_data:
+                        detected_job_name = base_name
+                        new_filename = f"{base_name}_{guid}_{new_ch}.tif"
+                        zip_out.writestr(new_filename, processed_data)
+        
+        if kjob_template_bytes:
+            # Aqui passamos o 'spray' para atualizar o JSON também
+            new_kjob_content = update_kjob_smart(kjob_template_bytes, guid, detected_job_name, spray)
+            if new_kjob_content:
+                zip_out.writestr(f"{detected_job_name}-job.kjob", new_kjob_content)
+    
+    return output_zip_buffer.getvalue()
+
+# --- MAIN UI ---
+def main():
+    st.set_page_config(page_title="Atlas QPP -> Apollo", layout="wide")
+    inject_corporate_styles()
+
+    if "master_guid" not in st.session_state:
+        st.session_state["master_guid"] = str(uuid.uuid4())
+
+    st.title("Atlas QPP ➡️ Apollo Converter")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("1. Files")
+        atlas_zip = st.file_uploader("Upload Atlas QPP ZIP", type=["zip"])
+        kjob_template = st.file_uploader("Upload Template .kjob", type=["kjob"])
+    
+    with col2:
+        st.subheader("2. Settings & ID")
+        
+        # Slider agora controla DUAS coisas: Intensidade da Imagem E Configuração do KJOB
+        spray = st.slider(
+            "Spray/Fluid Percentage (%)", 
+            min_value=0, max_value=100, value=100,
+            help="This value will update 'SpraySettings' in the .kjob file (e.g. 50% = 0.5)"
+        )
+        st.caption(f"Will be saved in KJOB as: **{spray/100.0}**")
+        
+        st.markdown("---")
+        st.markdown("#### 🔑 Active GUID (Master Field)")
+        
+        guid_final = st.text_input(
+            "Job GUID:", 
+            value=st.session_state["master_guid"],
+            key="input_guid_display"
+        )
+        st.session_state["master_guid"] = guid_final
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🎲 Random GUID"):
+                st.session_state["master_guid"] = str(uuid.uuid4())
+                st.rerun()
+        with c2:
+            if HAS_OCR:
+                uploaded_print = st.file_uploader("📷 OCR Scan", type=["png", "jpg", "jpeg"])
+                if uploaded_print:
+                    with st.spinner("Scanning..."):
+                        found = extract_guid_from_image(uploaded_print.getvalue())
+                        if found:
+                            st.session_state["master_guid"] = found
+                            st.rerun()
+
+    st.markdown("---")
+
+    if st.button("🚀 Process Apollo Package", type="primary"):
+        if atlas_zip and kjob_template and st.session_state["master_guid"]:
+            try:
+                with st.spinner(f"Processing... Setting Spray to {spray}%"):
+                    result = create_apollo_package(
+                        atlas_zip.getvalue(),
+                        kjob_template.getvalue(),
+                        spray,
+                        st.session_state["master_guid"]
+                    )
+                st.success("Done! Download below.")
+                st.download_button(
+                    "⬇ Download Final Package (.zip)",
+                    result,
+                    f"Apollo_{st.session_state['master_guid']}.zip",
+                    "application/zip"
+                )
+            except Exception as e:
+                st.error(f"Error: {e}")
+        else:
+            st.warning("Missing files or GUID.")
+
+if __name__ == "__main__":
+    main()

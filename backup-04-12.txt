@@ -1,0 +1,460 @@
+import json
+import zipfile
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, Tuple, Optional
+
+import streamlit as st
+import pandas as pd
+from PIL import Image, ImageFilter
+# --- Additional Imports for Histogram & Compare Mode ---
+import numpy as np
+import matplotlib.pyplot as plt
+
+def inject_corporate_styles():
+    st.markdown("""
+    <style>
+    :root {
+        --corp-blue: #8ab4f8;
+        --corp-bg: #0d1117;
+        --corp-panel: #161b22;
+        --corp-border: #30363d;
+        --corp-gray: #c9d1d9;
+    }
+
+    body, .main, .block-container {
+        background-color: var(--corp-bg) !important;
+        color: var(--corp-gray) !important;
+    }
+
+    h1, h2, h3 {
+        color: var(--corp-blue) !important;
+    }
+
+    .stDataFrame table {
+        border: 1px solid var(--corp-border);
+        background: var(--corp-panel);
+    }
+
+    .preview-box {
+        border: 1px solid var(--corp-border);
+        border-radius: 6px;
+        padding: 6px;
+        background: var(--corp-panel);
+        transition: transform 0.15s ease-in-out;
+    }
+    .preview-box:hover {
+        transform: scale(1.08) rotate3d(1,1,0,8deg);
+        box-shadow: 0 0 25px rgba(138,180,248,0.35);
+        border-color: var(--corp-blue);
+    }
+
+    .channel-label {
+        font-weight: 700;
+        padding: 4px 8px;
+        border-radius: 4px;
+        display: inline-block;
+        margin-bottom: 6px;
+    }
+    .C { background:#00b7f4; }
+    .M { background:#eb008b; }
+    .Y { background:#fce300; }
+    .K { background:#1d1d1d; color:white; }
+    .R { background:#ff4433; }
+    .G { background:#00cc66; }
+    .W { background:#ffffff; color:black; }
+    .Fc, .Fw { background:#9b59b6; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ---------------------------------------------------------
+# Constants
+# ---------------------------------------------------------
+
+DEFAULT_GUID = "6f346ae1-3cc7-4b46-a7d6-ab089222ab51"
+
+
+# Mapping between Apollo separation name → Atlas channel suffix
+# Atlas Qc → Apollo Fc
+# Atlas Qw → Apollo Fw
+# Others stay the same
+APOLLO_TO_ATLAS_CHANNEL_MAP = {
+    "C": "C",
+    "M": "M",
+    "Y": "Y",
+    "K": "K",
+    "R": "R",
+    "G": "G",
+    "W": "W",
+    "Fw": "Qw",   # Atlas Qw
+    "Fc": "Qc",   # Atlas Qc
+    "Iw": "Iw",
+    "Ic": "Ic",
+}
+ATLAS_TO_APOLLO_CHANNEL_MAP = {
+    "C": "C",
+    "M": "M",
+    "Y": "Y",
+    "K": "K",
+    "R": "R",
+    "G": "G",
+    "W": "W",
+    "Ic": "Fc",
+    "Iw": "Fw",
+    "Qc": "Fc",
+    "Qw": "Fw",
+}
+
+
+# ---------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------
+
+def parse_atlas_channels(atlas_dir: Path) -> Tuple[Optional[str], Dict[str, Path]]:
+    """
+    Detect Atlas Max channels from TIFF filenames.
+    Accepts filenames like:
+        atp v2.5 - amax plus-standard pallet_164670_XXXXX_C.tif
+
+    - Looks recursively in all subfolders
+    - Ignores macOS hidden files (._filename.tif) and __MACOSX
+    """
+
+    channels: Dict[str, Path] = {}
+    base_name: Optional[str] = None
+
+    valid_channels = {
+        "C", "M", "Y", "K", "R", "G", "W",
+        "Qc", "Qw", "Iw", "Ic"
+    }
+
+    # rglob -> search recursively in all subfolders
+    for tif_path in atlas_dir.rglob("*.tif"):
+
+        # Skip __MACOSX folders
+        if "__MACOSX" in tif_path.parts:
+            continue
+
+        # Skip macOS invisible files
+        if tif_path.name.startswith("._"):
+            continue
+
+        stem = tif_path.stem  # filename without extension
+
+        if "_" not in stem:
+            continue
+
+        # Split only on the LAST underscore
+        base_part, channel_part = stem.rsplit("_", 1)
+
+        if channel_part not in valid_channels:
+            continue
+
+        if base_name is None:
+            base_name = base_part
+
+        channels[channel_part] = tif_path
+
+    return base_name, channels
+
+
+def analyze_atlas_zip(atlas_zip_bytes):
+    import pandas as pd
+    from PIL import Image, ImageFilter
+    results = []
+    previews = {}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        atlas_zip = tmp / "atlas.zip"
+        atlas_zip.write_bytes(atlas_zip_bytes)
+        atlas_dir = tmp / "atlas"
+        atlas_dir.mkdir()
+        with zipfile.ZipFile(atlas_zip, "r") as z:
+            z.extractall(atlas_dir)
+
+        base_name, channels = parse_atlas_channels(atlas_dir)
+        if base_name is None:
+            raise ValueError("No valid channels detected.")
+
+        reference_size = None
+
+        for ch, tif_path in channels.items():
+            with Image.open(tif_path) as im:
+                im.load()
+                width, height = im.size
+                mode = im.mode
+                dpi = im.info.get("dpi", "-")
+
+                # Preview
+                prev = im.convert("L")
+                prev = prev.filter(ImageFilter.SHARPEN)
+                prev.thumbnail((180, 180))
+                previews[ch] = prev
+
+                if reference_size is None:
+                    reference_size = (width, height)
+                dim_ok = (width, height) == reference_size
+
+                results.append({
+                    "Channel": ch,
+                    "Mode": mode,
+                    "Size": f"{width} x {height}",
+                    "DPI": str(dpi),
+                    "Dimension Match": "🟢 OK" if dim_ok else "🟡 Mismatch"
+                })
+
+        df = pd.DataFrame(results)
+        return base_name, df, previews
+
+
+def convert_job(atlas_zip_bytes: bytes, spray_percentage: float, guid: str) -> bytes:
+    """
+    Converts Atlas Max TIFF separations zip into Apollo job zip.
+    This is a placeholder implementation that extracts the Atlas zip,
+    renames files according to Apollo conventions, and repacks into a new zip.
+    """
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        atlas_zip_path = tmp / "atlas.zip"
+        atlas_zip_path.write_bytes(atlas_zip_bytes)
+
+        atlas_dir = tmp / "atlas"
+        atlas_dir.mkdir()
+
+        with zipfile.ZipFile(atlas_zip_path, "r") as z:
+            z.extractall(atlas_dir)
+
+        base_name, channels = parse_atlas_channels(atlas_dir)
+        if base_name is None:
+            raise ValueError("No valid channels detected.")
+
+        # Create Apollo job directory
+        apollo_job_dir = tmp / "apollo_job"
+        apollo_job_dir.mkdir()
+
+        # Copy and rename TIFF files according to Apollo naming conventions
+        for atlas_ch, tif_path in channels.items():
+            apollo_ch = ATLAS_TO_APOLLO_CHANNEL_MAP.get(atlas_ch, atlas_ch)
+            new_filename = f"{base_name}_{guid}_{apollo_ch}.tif"
+            shutil.copy(tif_path, apollo_job_dir / new_filename)
+
+        # Create a settings JSON file with spray percentage and guid
+        settings = {
+            "spray_percentage": spray_percentage,
+            "guid": guid,
+            "base_name": base_name,
+            "channels": list(channels.keys()),
+        }
+        settings_path = apollo_job_dir / "settings.json"
+        with settings_path.open("w") as f:
+            json.dump(settings, f, indent=4)
+
+        # Create output zip
+        output_zip_path = tmp / "apollo_job.zip"
+        with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_DEFLATED) as out_zip:
+            for file_path in apollo_job_dir.iterdir():
+                out_zip.write(file_path, file_path.name)
+
+        return output_zip_path.read_bytes()
+
+# ---------------------------------------------------------
+# Helper to show previews grid with corporate style
+# ---------------------------------------------------------
+def show_previews_grid(previews):
+    if not previews:
+        return
+
+    st.markdown("### Channel Previews")
+
+    channels = list(previews.keys())
+    n = len(channels)
+    cols_per_row = 2 if n <= 2 else 4
+    cols = st.columns(cols_per_row)
+
+    for i, ch in enumerate(channels):
+        col = cols[i % cols_per_row]
+        with col:
+            st.markdown(f'<span class="channel-label {ch}">{ch}</span>', unsafe_allow_html=True)
+            st.markdown('<div class="preview-box">', unsafe_allow_html=True)
+            st.image(previews[ch], width=180)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------------------------------------------------------
+# Histogram Helper
+# ---------------------------------------------------------
+def show_histogram(image, channel_name):
+    arr = np.array(image.convert("L"))
+    fig, ax = plt.subplots(figsize=(3,2))
+    ax.hist(arr.flatten(), bins=50, color="#8ab4f8")
+    ax.set_title(f"Histogram – {channel_name}", color="white")
+    ax.set_facecolor("#0d1117")
+    fig.patch.set_facecolor("#0d1117")
+    ax.tick_params(axis='x', colors='white')
+    ax.tick_params(axis='y', colors='white')
+    st.pyplot(fig)
+
+# ---------------------------------------------------------
+# Compare Mode Helper
+# ---------------------------------------------------------
+def compare_mode(preview_img):
+    st.markdown("#### Before / After")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("Before")
+        st.image(preview_img, use_container_width=True)
+    with col2:
+        st.write("After (Sharpened)")
+        after = preview_img.filter(ImageFilter.SHARPEN)
+        st.image(after, use_container_width=True)
+
+# ---------------------------------------------------------
+# Fullscreen Preview Helper
+# ---------------------------------------------------------
+def fullscreen_preview(preview_img, channel):
+    st.markdown("### Fullscreen View")
+    st.markdown(
+        "<div style='border:1px solid #30363d; padding:8px; border-radius:6px;'>Use scroll to zoom</div>",
+        unsafe_allow_html=True
+    )
+    st.image(preview_img, use_container_width=True)
+
+# ---------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------
+
+def main():
+    st.set_page_config(
+        page_title="Apollo Job Converter",
+        page_icon="🛰️",
+        layout="centered"
+    )
+    inject_corporate_styles()
+
+    st.markdown("""
+    <style>
+    body::before {
+        content:"";
+        position: fixed;
+        top:0; left:0;
+        width:100%; height:100%;
+        background: radial-gradient(circle at 20% 20%, #1e2635, #0d1117 70%);
+        animation: glow 8s infinite alternate;
+        z-index:-2;
+    }
+    @keyframes glow {
+        0% { filter: hue-rotate(0deg) brightness(1.0); }
+        100% { filter: hue-rotate(60deg) brightness(1.3); }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.title("🛰️ Apollo Job Converter")
+    st.write(
+        """
+        This tool converts **Atlas Max** 1-bit TIFF separations into a fully
+        structured **Apollo job package**, generating a new job from scratch
+        and allowing custom Spray settings.
+        """
+    )
+
+    st.header("1. Upload separations")
+
+    atlas_zip = st.file_uploader(
+        "Atlas Max separations (.zip) — TIFFs inside with format <basename>_<channel>.tif",
+        type=["zip"]
+    )
+
+    if atlas_zip is not None:
+        tab1, tab2 = st.tabs([
+            "🔍 Validation",
+            "🖼 Previews"
+        ])
+
+        with tab1:
+            try:
+                base_name, df, previews = analyze_atlas_zip(atlas_zip.getvalue())
+                st.write("**Base name detected:**", base_name)
+                st.dataframe(df, use_container_width=True)
+            except Exception as e:
+                st.error(f"Validation failed: {e}")
+
+        with tab2:
+            try:
+                _, _, previews = analyze_atlas_zip(atlas_zip.getvalue())
+                show_previews_grid(previews)
+                st.markdown("""
+                <script>
+                document.addEventListener('keydown', function(e) {
+                    if(e.key === 'ArrowRight') {
+                        window.streamlitSend({'event':'next_channel'});
+                    }
+                    if(e.key === 'ArrowLeft') {
+                        window.streamlitSend({'event':'prev_channel'});
+                    }
+                });
+                </script>
+                """, unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Preview error: {e}")
+
+        # Masonry Grid (no tabs, just grid) -- removed per instructions
+
+    st.header("2. Settings")
+
+    spray = st.number_input(
+        "Spray Percentage",
+        min_value=0.0,
+        max_value=2.0,
+        value=0.5,
+        step=0.1
+    )
+
+    guid = st.text_input(
+        "GUID for Apollo TIFF filenames",
+        value=DEFAULT_GUID
+    )
+
+    st.markdown("---")
+
+    st.header("3. Convert to Apollo Job")
+
+    # Conversion mapping table
+    mapping_rows = []
+    for atlas_ch, apollo_ch in ATLAS_TO_APOLLO_CHANNEL_MAP.items():
+        status = "🟢 Same" if atlas_ch == apollo_ch else "🔄 Converted"
+        mapping_rows.append({
+            "Atlas Channel": atlas_ch,
+            "Apollo Channel": apollo_ch,
+            "Status": status
+        })
+    df_mapping = pd.DataFrame(mapping_rows)
+    st.markdown("### Atlas → Apollo Conversion Map")
+    st.dataframe(df_mapping, use_container_width=True)
+
+    if st.button("🚀 Convert to Apollo Job", type="primary"):
+        if atlas_zip is None:
+            st.error("Please upload the Atlas Max ZIP file first.")
+        else:
+            try:
+                with st.spinner("Converting Atlas → Apollo..."):
+                    result = convert_job(
+                        atlas_zip_bytes=atlas_zip.getvalue(),
+                        spray_percentage=spray,
+                        guid=guid,
+                    )
+                st.success("Conversion completed!")
+                st.download_button(
+                    "⬇ Download Apollo Job (.zip)",
+                    result,
+                    file_name="apollo_converted_job.zip",
+                    mime="application/zip"
+                )
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
+
+
+if __name__ == "__main__":
+    main()
