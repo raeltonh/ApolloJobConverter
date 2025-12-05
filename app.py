@@ -18,12 +18,12 @@ import warnings
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-# --- CONFIGURAÇÃO TÉCNICA ---
-# Aumenta limite de pixels para arquivos grandes de impressão têxtil
+# --- SYSTEM CONFIGURATION ---
+# Increase pixel limit for large textile print files
 Image.MAX_IMAGE_PIXELS = 500_000_000 
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
-# Configuração OCR (Opcional, se instalado no Mac)
+# OCR Configuration (Optional, handles Mac/Linux differences)
 HAS_OCR = False
 try:
     import pytesseract
@@ -31,7 +31,7 @@ try:
 except ImportError:
     pass
 
-# --- ESTILOS VISUAIS (INTERFACE) ---
+# --- VISUAL STYLES ---
 def inject_corporate_styles():
     st.markdown("""
     <style>
@@ -43,7 +43,7 @@ def inject_corporate_styles():
     </style>
     """, unsafe_allow_html=True)
 
-# --- MAPA DE CANAIS (ATLAS -> APOLLO) ---
+# --- CHANNEL MAPPING (ATLAS -> APOLLO) ---
 ATLAS_TO_APOLLO_CHANNEL_MAP = {
     "C": "C", "M": "M", "Y": "Y", "K": "K", 
     "R": "R", "G": "G", "W": "W",
@@ -52,25 +52,25 @@ ATLAS_TO_APOLLO_CHANNEL_MAP = {
     "Varnish": "Q.fix"
 }
 
-# --- FUNÇÕES DE PROCESSAMENTO ---
+# --- PROCESSING FUNCTIONS ---
 
 def extract_guid_from_image(image_bytes: bytes) -> str:
-    """Tenta ler o GUID de um print usando OCR."""
+    """Attempts to extract GUID from a screenshot using OCR."""
     if not HAS_OCR: return None
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
             img = img.convert('L')
             text = pytesseract.image_to_string(img)
-            # Regex para encontrar formato UUID (xxxxxxxx-xxxx...)
+            # Regex to find UUID format (xxxxxxxx-xxxx...)
             uuid_pattern = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
             match = re.search(uuid_pattern, text)
             return match.group(0) if match else None
     except Exception: return None
 
-def process_channel_image(image_bytes: bytes, filename: str, spray_percentage: int) -> Tuple[Optional[bytes], str, str, Optional[Image.Image], dict]:
+def process_channel_image(image_bytes: bytes, filename: str, spray_percentage: int, force_dpi: int = 0) -> Tuple[Optional[bytes], str, str, Optional[Image.Image], dict]:
     """
-    Processa a imagem, converte canais e extrai METADADOS (DPI/Tamanho).
-    Retorna: bytes, nome_base, sufixo_novo, thumbnail, metadados
+    Processes the image, converts channels, and extracts METADATA (DPI/Size).
+    Returns: bytes, base_name, new_suffix, thumbnail, metadata
     """
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
@@ -81,7 +81,7 @@ def process_channel_image(image_bytes: bytes, filename: str, spray_percentage: i
 
             new_suffix = ATLAS_TO_APOLLO_CHANNEL_MAP.get(original_suffix)
             if not new_suffix:
-                # Fallback manual para letras maiúsculas
+                # Manual fallback for uppercase
                 s_upper = original_suffix.upper()
                 if s_upper == "IW": new_suffix = "Fw"
                 elif s_upper == "IC": new_suffix = "Fc"
@@ -89,13 +89,16 @@ def process_channel_image(image_bytes: bytes, filename: str, spray_percentage: i
                 elif s_upper == "QC": new_suffix = "Fc"
                 else: return None, base_name, "", None, {}
 
-            # --- LEITURA INTELIGENTE DE METADADOS ---
+            # --- SMART METADATA READING ---
             width_px, height_px = img.size
             
-            # Tenta ler a etiqueta de DPI. Se não existir, assume padrão 600.
-            dpi = img.info.get('dpi', (600, 600))
-            if isinstance(dpi, tuple): dpi_x, dpi_y = dpi
-            else: dpi_x = dpi_y = dpi
+            # If manual DPI is forced, use it. Otherwise, auto-detect.
+            if force_dpi > 0:
+                dpi_x = dpi_y = force_dpi
+            else:
+                dpi = img.info.get('dpi', (600, 600))
+                if isinstance(dpi, tuple): dpi_x, dpi_y = dpi
+                else: dpi_x = dpi_y = dpi
             
             dpi_x = int(dpi_x) if dpi_x else 600
             dpi_y = int(dpi_y) if dpi_y else 600
@@ -106,21 +109,21 @@ def process_channel_image(image_bytes: bytes, filename: str, spray_percentage: i
                 "dpi_x": dpi_x,
                 "dpi_y": dpi_y
             }
-            # ----------------------------------------
+            # ------------------------------
 
             if img.mode != 'L': img = img.convert('L')
             
-            # Aplica redução de intensidade se for canal de fluido
+            # Apply intensity reduction if it is a fluid channel
             if new_suffix in ["Q.fix", "Fw", "Fc"] and spray_percentage < 100:
                 arr = np.array(img, dtype=float) * (spray_percentage / 100.0)
                 img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-                img.info['dpi'] = (dpi_x, dpi_y) # Mantém DPI na nova imagem
+                img.info['dpi'] = (dpi_x, dpi_y) # Maintain DPI
 
-            # Cria Thumbnail
+            # Create Thumbnail
             thumb = img.copy()
             thumb.thumbnail((800, 800))
 
-            # Salva
+            # Save
             buffer = io.BytesIO()
             img.save(buffer, format="TIFF", compression="tiff_lzw", dpi=(dpi_x, dpi_y))
             
@@ -128,7 +131,7 @@ def process_channel_image(image_bytes: bytes, filename: str, spray_percentage: i
     except Exception: return None, "", "", None, {}
 
 def generate_composite_preview(channels_data: List[dict]) -> Image.Image:
-    """Gera visualização CMYK colorida."""
+    """Generates a CMYK color composite preview."""
     ch_map = {item['suffix']: item['thumb'] for item in channels_data}
     if not ch_map: return None
     base_img = next(iter(ch_map.values()))
@@ -147,7 +150,7 @@ def generate_composite_preview(channels_data: List[dict]) -> Image.Image:
     return composite
 
 def save_image_to_pdf(pil_image: Image.Image) -> bytes:
-    """Salva apenas a imagem dentro de um PDF."""
+    """Saves only the image inside a PDF (clean layout)."""
     buffer = io.BytesIO()
     w, h = pil_image.size
     c = canvas.Canvas(buffer, pagesize=(w, h))
@@ -160,11 +163,10 @@ def save_image_to_pdf(pil_image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 def recursive_update(data, key_target, new_value):
-    """Atualiza um valor no JSON recursivamente."""
+    """Recursively updates a value in the JSON."""
     if isinstance(data, dict):
         for key, value in data.items():
             if key == key_target:
-                # Atualiza apenas se for valor direto ou dicionário específico
                 if isinstance(value, (int, float, str)) or key_target == "SpraySettings":
                      if key_target == "SpraySettings" and "Percentage" in value:
                          value["Percentage"] = new_value
@@ -175,34 +177,34 @@ def recursive_update(data, key_target, new_value):
 
 def update_kjob_full(kjob_bytes: bytes, new_guid: str, job_name: str, spray_percent: int, pdf_name: str, meta: dict) -> Tuple[str, float, float]:
     """
-    Atualiza ID, Spray, Nomes e DIMENSÕES do KJOB.
+    Updates ID, Spray, File Names, and DIMENSIONS in the KJOB.
     """
     try:
         content_str = kjob_bytes.decode('utf-8', errors='ignore')
         data = json.loads(content_str)
         
-        # 1. IDs e Nome
+        # 1. IDs and Name
         if "IdentificationDetails" in data:
             if "JobIdentifier" in data["IdentificationDetails"]:
                 data["IdentificationDetails"]["JobIdentifier"]["Id"] = new_guid
-            # Nome Interno = NomeDoJob_GUID
+            # Internal Name = JobName_GUID
             data["IdentificationDetails"]["JobName"] = f"{job_name}_{new_guid}"
         
-        # 2. Spray (Atualiza no JSON onde achar 'SpraySettings')
+        # 2. Spray (Update JSON where 'SpraySettings' is found)
         recursive_update(data, "SpraySettings", round(spray_percent / 100.0, 2))
 
-        # 3. CÁLCULO DE DIMENSÕES (Pixels -> mm)
-        # Fórmula: (Pixels / DPI) * 25.4
+        # 3. DIMENSION CALCULATION (Pixels -> mm)
+        # Formula: (Pixels / DPI) * 25.4
         width_mm = round((meta['width_px'] / meta['dpi_x']) * 25.4, 2)
         height_mm = round((meta['height_px'] / meta['dpi_y']) * 25.4, 2)
 
-        # 4. Atualização de Arquivos e Tamanhos
+        # 4. File and Size Updates
         png_name = f"Preview-{new_guid}.png"
         
         if "PrintSectionList" in data and isinstance(data["PrintSectionList"], list):
             for section in data["PrintSectionList"]:
                 
-                # A) Atualiza Tamanho da Seção
+                # A) Update Section Size
                 if "Size" in section:
                     section["Size"]["Width"] = width_mm
                     section["Size"]["Height"] = height_mm
@@ -210,7 +212,7 @@ def update_kjob_full(kjob_bytes: bytes, new_guid: str, job_name: str, spray_perc
                     section["RawSize"]["Width"] = width_mm
                     section["RawSize"]["Height"] = height_mm
 
-                # B) Atualiza Imagens (Preview e PDF)
+                # B) Update Images (Preview and PDF)
                 if "ImageProperties" in section:
                     props = section["ImageProperties"]
                     
@@ -225,7 +227,7 @@ def update_kjob_full(kjob_bytes: bytes, new_guid: str, job_name: str, spray_perc
                     if "ImagesForPrint" in props and isinstance(props["ImagesForPrint"], list):
                         for img_ref in props["ImagesForPrint"]:
                             img_ref["Name"] = pdf_name
-                            # Atualiza tamanho do PDF também
+                            # Update PDF size as well
                             if "Size" in img_ref:
                                 img_ref["Size"]["Width"] = width_mm
                                 img_ref["Size"]["Height"] = height_mm
@@ -236,59 +238,59 @@ def update_kjob_full(kjob_bytes: bytes, new_guid: str, job_name: str, spray_perc
         return json.dumps(data, indent=2), width_mm, height_mm
     except Exception: return "", 0, 0
 
-def create_apollo_package(atlas_zip_bytes: bytes, kjob_template_bytes: bytes, spray: int, guid: str) -> dict:
+def create_apollo_package(atlas_zip_bytes: bytes, kjob_template_bytes: bytes, spray: int, guid: str, force_dpi: int) -> dict:
     output_zip_buffer = io.BytesIO()
-    # Dicionário de resultados para mostrar na tela depois
+    # Result dictionary to show on screen later
     job_result = {"name": "Job", "w_mm": 0, "h_mm": 0, "dpi": 0, "visuals": [], "preview": None}
     
     channels_data = [] 
     reference_meta = None 
 
     with zipfile.ZipFile(output_zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_out:
-        # 1. Processar TIFFs
+        # 1. Process TIFFs
         with zipfile.ZipFile(io.BytesIO(atlas_zip_bytes), "r") as zip_in:
             for file_info in zip_in.infolist():
                 if file_info.filename.lower().endswith((".tif", ".tiff")) and not file_info.filename.startswith("__MACOSX"):
                     with zip_in.open(file_info) as file: image_data = file.read()
                     
-                    # Processa imagem e pega metadados
-                    processed_data, base_name, new_ch, thumb, meta = process_channel_image(image_data, file_info.filename, spray)
+                    # Process image and get metadata
+                    processed_data, base_name, new_ch, thumb, meta = process_channel_image(image_data, file_info.filename, spray, force_dpi)
                     
                     if processed_data:
                         job_result["name"] = base_name
-                        # Usa o primeiro arquivo válido como referência de tamanho/dpi
+                        # Use the first valid file as reference for size/dpi
                         if reference_meta is None and meta:
                             reference_meta = meta
                             job_result["dpi"] = meta["dpi_x"]
                         
-                        # Salva TIFF no ZIP com GUID
+                        # Save TIFF to ZIP with GUID
                         new_filename = f"{base_name}_{guid}_{new_ch}.tif"
                         zip_out.writestr(new_filename, processed_data)
                         channels_data.append({"suffix": new_ch, "thumb": thumb})
 
-        # 2. Gerar Previews (PDF/PNG)
+        # 2. Generate Previews (PDF/PNG)
         if channels_data:
             job_result["visuals"] = channels_data
             comp = generate_composite_preview(channels_data)
             job_result["preview"] = comp
             
-            # Salva PNG: Preview-{GUID}.png
+            # Save PNG: Preview-{GUID}.png
             png_buf = io.BytesIO()
             comp.save(png_buf, format='PNG')
             zip_out.writestr(f"Preview-{guid}.png", png_buf.getvalue())
 
-            # Salva PDF: NomeLimpo.pdf
+            # Save PDF: CleanName.pdf
             pdf_name = f"{job_result['name']}.pdf"
             pdf_bytes = save_image_to_pdf(comp)
             zip_out.writestr(pdf_name, pdf_bytes)
 
-        # 3. Atualizar KJOB
+        # 3. Update KJOB
         if kjob_template_bytes and reference_meta:
             new_kjob, w_final, h_final = update_kjob_full(
                 kjob_template_bytes, guid, job_result["name"], spray, f"{job_result['name']}.pdf", reference_meta
             )
             if new_kjob:
-                # Salva KJOB: NomeLimpo_GUID-job.kjob
+                # Save KJOB: CleanName_GUID-job.kjob
                 kjob_filename = f"{job_result['name']}_{guid}-job.kjob"
                 zip_out.writestr(kjob_filename, new_kjob)
                 job_result["w_mm"] = w_final
@@ -296,42 +298,58 @@ def create_apollo_package(atlas_zip_bytes: bytes, kjob_template_bytes: bytes, sp
     
     return output_zip_buffer.getvalue(), job_result
 
-# --- INTERFACE PRINCIPAL ---
+# --- MAIN INTERFACE ---
 def main():
-    st.set_page_config(page_title="Atlas QPP -> Apollo", layout="wide")
+    st.set_page_config(page_title="Atlas QPP -> Apollo Converter", layout="wide")
     inject_corporate_styles()
 
     if "master_guid" not in st.session_state: st.session_state["master_guid"] = str(uuid.uuid4())
     if "final_result" not in st.session_state: st.session_state["final_result"] = None
 
     st.title("Atlas QPP ➡️ Apollo Converter")
-    st.markdown("**Versão Final:** Auto-dimensionamento + Correção de Canais + Controle de Químico")
+    st.markdown("**Core Features:** Auto-Dimensioning + Channel Correction + Chemical Control")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("1. Arquivos")
-        atlas_zip = st.file_uploader("Upload Atlas ZIP", type=["zip"])
+        st.subheader("1. Input Files")
+        atlas_zip = st.file_uploader("Upload Atlas QPP ZIP", type=["zip"])
         kjob_template = st.file_uploader("Upload Template .kjob", type=["kjob"])
     
     with col2:
-        st.subheader("2. Configurações")
-        spray = st.slider("Intensidade Químico (Spray) %", 0, 100, 100)
-        st.caption(f"Valor no KJOB: **{spray/100.0}**")
+        st.subheader("2. Settings")
         
-        st.markdown("#### 🔑 GUID (Identificador)")
-        guid_final = st.text_input("GUID Ativo:", value=st.session_state["master_guid"], key="input_guid_display")
+        # --- SMART DPI SELECTOR ---
+        st.markdown("##### 📏 Image Resolution Strategy")
+        dpi_option = st.radio(
+            "How to detect resolution?",
+            ["Auto-Detect (Recommended)", "Force Manual DPI"],
+            horizontal=True
+        )
+        
+        force_dpi = 0
+        if dpi_option == "Force Manual DPI":
+            force_dpi = st.number_input("Enter DPI (ex: 600 or 1200):", min_value=72, max_value=2400, value=600)
+            st.warning("⚠️ Warning: Forcing incorrect DPI will result in wrong print size!")
+        else:
+            st.info("ℹ️ Using internal TIFF metadata. Safest option.")
+
+        spray = st.slider("Chemical Intensity (Spray) %", 0, 100, 100)
+        st.caption(f"KJOB Value: **{spray/100.0}**")
+        
+        st.markdown("#### 🔑 GUID (Identifier)")
+        guid_final = st.text_input("Active GUID:", value=st.session_state["master_guid"], key="input_guid_display")
         st.session_state["master_guid"] = guid_final
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("🎲 Gerar Novo Aleatório"):
+            if st.button("🎲 Generate Random"):
                 st.session_state["master_guid"] = str(uuid.uuid4())
                 st.rerun()
         with c2:
             if HAS_OCR:
-                uploaded_print = st.file_uploader("📷 Ler GUID de Print", type=["png", "jpg"])
+                uploaded_print = st.file_uploader("📷 OCR Scan (GUID)", type=["png", "jpg"])
                 if uploaded_print:
-                    with st.spinner("Lendo imagem..."):
+                    with st.spinner("Scanning image..."):
                         found = extract_guid_from_image(uploaded_print.getvalue())
                         if found:
                             st.session_state["master_guid"] = found
@@ -339,40 +357,41 @@ def main():
 
     st.markdown("---")
 
-    if st.button("🚀 Processar Job Completo", type="primary"):
+    if st.button("🚀 Process Job Package", type="primary"):
         if atlas_zip and kjob_template and st.session_state["master_guid"]:
             try:
-                with st.spinner("Analisando DPI, Calculando Dimensões e Gerando Pacote..."):
+                with st.spinner("Analyzing DPI, Calculating Dimensions & Generating Package..."):
                     zip_data, info = create_apollo_package(
                         atlas_zip.getvalue(),
                         kjob_template.getvalue(),
                         spray,
-                        st.session_state["master_guid"]
+                        st.session_state["master_guid"],
+                        force_dpi
                     )
                     st.session_state["final_result"] = (zip_data, info)
                 
-                st.success("Conversão com Sucesso! Confira os dados técnicos abaixo.")
+                st.success("Conversion Successful! Check technical data below.")
                 
             except Exception as e:
-                st.error(f"Erro Crítico: {e}")
+                st.error(f"Critical Error: {e}")
         else:
-            st.warning("Faltam arquivos ou GUID.")
+            st.warning("Missing files or GUID.")
 
-    # --- RELATÓRIO PÓS-PROCESSAMENTO ---
+    # --- POST-PROCESSING REPORT ---
     if st.session_state["final_result"]:
         zip_file, data = st.session_state["final_result"]
         
-        st.markdown("### 📋 Relatório Técnico do Job Gerado")
+        st.markdown("### 📋 Generated Job Technical Report")
         
-        # Métricas de Engenharia
+        # Engineering Metrics
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Resolução Detectada", f"{data['dpi']} DPI")
-        m2.metric("Largura Final", f"{data['w_mm']} mm")
-        m3.metric("Altura Final", f"{data['h_mm']} mm")
-        m4.metric("Spray Configurado", f"{spray}%")
+        m1.metric("Detected Resolution", f"{data['dpi']} DPI")
+        m2.metric("Final Width", f"{data['w_mm']} mm")
+        m3.metric("Final Height", f"{data['h_mm']} mm")
+        m4.metric("Spray Setting", f"{spray}%")
         
         st.download_button(
-            label="⬇ Baixar Pacote Apollo Pronto (.zip)",
+            label="⬇ Download Ready Apollo Package (.zip)",
             data=zip_file,
             file_name=f"Apollo_{st.session_state['master_guid']}.zip",
             mime="application/zip"
@@ -380,17 +399,17 @@ def main():
 
         st.markdown("---")
         
-        # Visualização (Preview Máquina + Canais Separados)
+        # Visualization (Machine Preview + Separate Channels)
         c1, c2 = st.columns([1, 2])
         if data["preview"]:
             with c1:
-                st.image(data["preview"], caption=f"Preview-{st.session_state['master_guid']}.png (Tela Máquina)")
+                st.image(data["preview"], caption=f"Preview-{st.session_state['master_guid']}.png (Machine Screen)")
             with c2:
-                st.info("Visualização composta (CMYK simulado). O PDF gerado contém esta mesma imagem.")
+                st.info("Composite visualization (Simulated CMYK). The generated PDF contains this same image.")
 
-        st.subheader("🎨 Canais Individuais (Verificação)")
+        st.subheader("🎨 Individual Channels (Verification)")
         vis_data = data["visuals"]
-        # Ordena canais
+        # Sort channels
         order = {"C":1, "M":2, "Y":3, "K":4, "R":5, "G":6, "W":7, "Fw":8, "Fc":9, "Q.fix":10}
         vis_data.sort(key=lambda x: order.get(x["suffix"], 99))
         
